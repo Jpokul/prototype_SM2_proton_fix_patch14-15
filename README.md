@@ -14,3 +14,5 @@ Remember to use a separate folder for the files provided. If you view the conten
 The end path should look similar to this: <b>/home/(YourUsername)/.local/share/Steam/compatibilitytools.d/SM2_20261002_ntdll_and_abandon_mutexes_prototype_fix/</b>
 
 After you put the directory there, restart Steam, access game properties, compatibility, check force use of a specific Steam Play compatibility tool, and select SM2_20261002_ntdll_and_abandon_mutexes_prototype_fix
+
+#### Download from: https://github.com/Jpokul/prototype_SM2_proton_fix_patch14-15/releases/tag/Zip
