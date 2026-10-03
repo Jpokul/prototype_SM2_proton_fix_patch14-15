@@ -47,3 +47,9 @@ https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943056744
 https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943164082
 
 https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943989743
+
+Links to WineHQ bug reports if a professional developer would like to help fix the issue upstream:
+
+https://bugs.winehq.org/show_bug.cgi?id=60397
+
+https://bugs.winehq.org/show_bug.cgi?id=60417
