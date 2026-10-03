@@ -7,6 +7,7 @@ The base Proton version used is https://github.com/ValveSoftware/Proton
 
 All rights belong to their respective owners.
 
+## Usage
 To use it, extract the folder containing all the files to a separate folder in <b>~/.steam/root/compatibilitytools.d/</b>
 
 Remember to use a separate folder for the files provided. If you view the contents of the aforementioned path, you will see other Proton versions Steam uses that will give you an idea of how the end structure should look.
