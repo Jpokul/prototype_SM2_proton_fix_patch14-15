@@ -3,6 +3,8 @@ A prototype fix created by jegglest (https://github.com/jegglest) using LLM that
 
 Compiled by me to play comfortably until official fixes are available.
 
+The theory and code behind it are linked at the bottom of this page.
+
 The base Proton version used is https://github.com/ValveSoftware/Proton
 
 All rights belong to their respective owners.
@@ -24,9 +26,9 @@ After you put the directory there, restart Steam, access game properties, compat
 ___
 
 # How it works
-I only compiled the solution, and there is nothing describing the issue or how the solution works.
+I only compiled the solution, and there is nothing describing the issue or how the solution works in this repository.
 
-As I saw this repo referenced, I must refer you to a collection of posts jegglest made that led to this repo:
+However, as I saw this repo referenced, I must refer you to a collection of posts jegglest made which led to the fix:
 
 https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5852529635
 
