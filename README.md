@@ -53,3 +53,5 @@ Links to WineHQ bug reports if a professional developer would like to help fix t
 https://bugs.winehq.org/show_bug.cgi?id=60397
 
 https://bugs.winehq.org/show_bug.cgi?id=60417
+
+2nd WineHQ link (60417) isn't required for this fix to work (it is included here, though), but it was discovered in the process of finding the first.
