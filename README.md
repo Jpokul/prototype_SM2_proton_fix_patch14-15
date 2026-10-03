@@ -20,3 +20,28 @@ The end path should look similar to this: <b>/home/(YourUsername)/.local/share/S
 After you put the directory there, restart Steam, access game properties, compatibility tab, check "Force the use of a specific Steam Play compatibility tool", and select SM2_20261002_ntdll_and_abandon_mutexes_prototype_fix
 
 #### Download from: https://github.com/Jpokul/prototype_SM2_proton_fix_patch14-15/releases/tag/Zip
+
+___
+
+# How it works
+I only compiled the solution, and there is nothing describing the issue or how the solution works.
+
+As I saw this repo referenced, I must refer you to a collection of posts jegglest made that led to this repo:
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5852529635
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5858321198
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5858593607
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5858321198
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5858593607
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5903294489
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943056744
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943164082
+
+https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5943989743
