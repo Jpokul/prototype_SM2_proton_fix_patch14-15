@@ -26,9 +26,9 @@ After you put the directory there, restart Steam, access game properties, compat
 ___
 
 # How it works
-I only compiled the solution, and there is nothing describing the issue or how the solution works in this repository.
+I only compiled the solution. As I saw growing concerns that this might be malware, I added .patch files I used in the creation process. The fix was compiled using the adea6cb commit of https://github.com/ValveSoftware/Proton.
 
-However, as I saw this repo referenced, I must refer you to a collection of posts jegglest made which led to the fix:
+I also refer you to a collection of posts jegglest made which led to the fix:
 
 https://github.com/ValveSoftware/Proton/issues/8072#issuecomment-5852529635
 
