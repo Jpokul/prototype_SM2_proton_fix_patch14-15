@@ -1,0 +1,172 @@
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 18e61e4..acf2df5 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -881,6 +881,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+ {
+     struct futex_queue *queue = get_futex_queue( addr );
+     struct futex_entry entry;
++    BOOL queued = FALSE;
+     NTSTATUS ret;
+ 
+     TRACE("addr %p cmp %p size %#Ix timeout %s\n", addr, cmp, size, debugstr_timeout( timeout ));
+@@ -909,15 +910,25 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+ 
+     ret = NtWaitForAlertByThreadId( NULL, timeout );
+ 
+-    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
+-    if (entry.addr)
++    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). They clear
++     * the address last, with release semantics: once it is NULL the waker is done with the entry. */
++    if (ReadPointerAcquire( (void * const volatile *)&entry.addr ))
+     {
+         spin_lock( &queue->lock );
+-        if (entry.addr)
++        if ((queued = entry.addr != NULL))
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
+ 
++    if (!queued && ret == STATUS_TIMEOUT)
++    {
++        /* A waker removed us as the wait timed out: we have been woken, and the waker alerts us right after
++         * releasing the queue lock. Take that alert, as Windows does, or it would end this thread's next wait
++         * early, whatever it waits for. */
++        NtWaitForAlertByThreadId( NULL, NULL );
++        ret = STATUS_SUCCESS;
++    }
++
+     TRACE("returning %#lx\n", ret);
+ 
+     if (ret == STATUS_ALERTED) ret = STATUS_SUCCESS;
+@@ -947,14 +958,17 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+     {
+         if (entry->addr == addr)
+         {
+-            entry->addr = NULL;
+-            list_remove( &entry->entry );
+             if (count == ARRAY_SIZE(tids))
+             {
+                 NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+                 count = 0;
+             }
+             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
++            list_remove( &entry->entry );
++
++            /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
++             * cleared, so this must be our last access to it. */
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+         }
+     }
+ 
+@@ -994,8 +1008,11 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+             /* Remove this entry from the queue, so that a simultaneous call to
+              * RtlWakeAddressSingle() will not also wake it—two simultaneous
+              * calls must wake at least two waiters if they exist. */
+-            entry->addr = NULL;
+             list_remove( &entry->entry );
++
++            /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
++             * cleared, so this must be our last access to it. */
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             break;
+         }
+     }
+diff --git a/dlls/ntdll/tests/sync.c b/dlls/ntdll/tests/sync.c
+index dcbb8b1..0239280 100644
+--- a/dlls/ntdll/tests/sync.c
++++ b/dlls/ntdll/tests/sync.c
+@@ -615,6 +615,85 @@ static void test_wait_on_address(void)
+     ok(address == 0, "got %s\n", wine_dbgstr_longlong(address));
+ }
+ 
++struct wait_on_address_waker
++{
++    LONG address;
++    volatile LONG stop;
++    BOOL wake_all;
++};
++
++static DWORD WINAPI wait_on_address_waker_thread( void *arg )
++{
++    struct wait_on_address_waker *waker = arg;
++
++    while (!waker->stop)
++    {
++        if (waker->wake_all) pRtlWakeAddressAll( &waker->address );
++        else pRtlWakeAddressSingle( &waker->address );
++    }
++    return 0;
++}
++
++static void test_wait_on_address_raced_wake(void)
++{
++    static const LONGLONG timeouts[] = {0, -1};
++    static const LARGE_INTEGER zero;
++    struct wait_on_address_waker waker;
++    unsigned int i, count, pending, early, failed;
++    LARGE_INTEGER timeout;
++    LONG compare = 0, other = 0;
++    NTSTATUS status;
++    HANDLE thread;
++    DWORD start;
++
++    if (!pRtlWaitOnAddress)
++    {
++        win_skip("RtlWaitOnAddress not supported, skipping test\n");
++        return;
++    }
++
++    /* A wake that races the end of a short wait may be taken by that wait, but it must not leave an alert
++     * pending on the thread, which would end its next wait on anything early. */
++    for (i = 0; i < ARRAY_SIZE(timeouts) * 2; i++)
++    {
++        winetest_push_context( "timeout %s, %s", wine_dbgstr_longlong( timeouts[i / 2] ),
++                               i % 2 ? "wake all" : "wake single" );
++
++        waker.address = 0;
++        waker.stop = 0;
++        waker.wake_all = i % 2;
++        thread = CreateThread( NULL, 0, wait_on_address_waker_thread, &waker, 0, NULL );
++
++        pending = early = failed = 0;
++        start = GetTickCount();
++        for (count = 0; count < 20000 && GetTickCount() - start < 1000; count++)
++        {
++            timeout.QuadPart = timeouts[i / 2];
++            status = pRtlWaitOnAddress( &waker.address, &compare, sizeof(compare), &timeout );
++            if (status != STATUS_SUCCESS && status != STATUS_TIMEOUT) failed++;
++
++            if (pNtWaitForAlertByThreadId)
++            {
++                if (pNtWaitForAlertByThreadId( NULL, &zero ) == STATUS_ALERTED) pending++;
++            }
++            else
++            {
++                timeout.QuadPart = -1;
++                if (pRtlWaitOnAddress( &other, &compare, sizeof(compare), &timeout ) != STATUS_TIMEOUT) early++;
++            }
++        }
++
++        waker.stop = 1;
++        WaitForSingleObject( thread, INFINITE );
++        CloseHandle( thread );
++
++        ok( !failed, "%u of %u waits failed\n", failed, count );
++        ok( !pending, "%u of %u waits left an alert pending\n", pending, count );
++        ok( !early, "%u of %u waits on another address returned early\n", early, count );
++        winetest_pop_context();
++    }
++}
++
+ static HANDLE thread_ready, thread_done;
+ 
+ static DWORD WINAPI resource_shared_thread(void *arg)
+@@ -1474,6 +1553,7 @@ START_TEST(sync)
+     pRtlBarrier                     = (void *)GetProcAddress(module, "RtlBarrier");
+ 
+     test_wait_on_address();
++    test_wait_on_address_raced_wake();
+     test_event();
+     test_mutant();
+     test_semaphore();

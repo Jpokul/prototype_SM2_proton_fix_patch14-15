@@ -1,0 +1,482 @@
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 112157b..faba490 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1863,6 +1863,8 @@ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES
+ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE dest_process, HANDLE *dest,
+                                    ACCESS_MASK access, ULONG attributes, ULONG options )
+ {
++    struct inproc_sync *cache = NULL;
++    unsigned int serial = 0;
+     sigset_t sigset;
+     unsigned int ret;
+     int fd = -1;
+@@ -1899,7 +1901,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+     if (options & DUPLICATE_CLOSE_SOURCE)
+     {
+         fd = remove_fd_from_cache( source );
+-        close_inproc_sync( source );
++        cache = close_inproc_sync_begin( source, &serial );
+     }
+ 
+     SERVER_START_REQ( dup_handle )
+@@ -1910,12 +1912,14 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+         req->access      = access;
+         req->attributes  = attributes;
+         req->options     = options;
++        req->inproc_serial = serial;
+         if (!(ret = wine_server_call( req )))
+         {
+             if (dest) *dest = wine_server_ptr_handle( reply->handle );
+         }
+     }
+     SERVER_END_REQ;
++    if (cache) close_inproc_sync_end( cache, serial );
+ 
+     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+@@ -1958,6 +1962,8 @@ NTSTATUS WINAPI NtCompareTokens( HANDLE first, HANDLE second, BOOLEAN *equal )
+  */
+ NTSTATUS WINAPI NtClose( HANDLE handle )
+ {
++    struct inproc_sync *cache;
++    unsigned int serial;
+     sigset_t sigset;
+     HANDLE port;
+     unsigned int ret;
+@@ -1973,14 +1979,16 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+     /* always remove the cached fd; if the server request fails we'll just
+      * retrieve it again */
+     fd = remove_fd_from_cache( handle );
+-    close_inproc_sync( handle );
++    cache = close_inproc_sync_begin( handle, &serial );
+ 
+     SERVER_START_REQ( close_handle )
+     {
+         req->handle = wine_server_obj_handle( handle );
++        req->inproc_serial = serial;
+         ret = wine_server_call( req );
+     }
+     SERVER_END_REQ;
++    if (cache) close_inproc_sync_end( cache, serial );
+ 
+     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 67ab945..b0e4a10 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -542,8 +542,11 @@ struct inproc_sync
+     unsigned int   access;    /* handle access rights */
+     unsigned short type;      /* enum inproc_sync_type as short to save space */
+     unsigned short closed;    /* fd has been closed but sync is still referenced */
++    unsigned int   serial;    /* id of this cache entry for the server, 0 if not cached */
+ };
+ 
++static LONG next_inproc_sync_serial;
++
+ #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+ #define INPROC_SYNC_CACHE_ENTRIES     128
+ 
+@@ -604,6 +607,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync
+     cache->access = sync->access;
+     cache->type = sync->type;
+     cache->closed = sync->closed;
++    while (!(cache->serial = InterlockedIncrement( &next_inproc_sync_serial ))) ;
+     /* Make sure we set the other members before the refcount; this store needs
+      * release semantics [paired with the load in get_cached_inproc_sync()].
+      * Set the refcount to 2 (one for the handle, one for the caller). */
+@@ -628,15 +632,31 @@ static inline LONG interlocked_inc_if_nonzero( LONG *dest )
+     return val;
+ }
+ 
++static void release_detached_inproc_sync( unsigned int serial )
++{
++    SERVER_START_REQ( release_inproc_sync )
++    {
++        req->serial = serial;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
+ static void release_inproc_sync( struct inproc_sync *sync )
+ {
+-    /* save the fd now; as soon as the refcount hits 0 we cannot
++    /* save the fd and serial now; as soon as the refcount hits 0 we cannot
+      * access the cache anymore */
+     int fd = sync->fd;
++    unsigned int serial = sync->serial;
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+-    if (!ref) close( fd );
++    if (ref) return;
++    close( fd );
++    /* The handle was closed while the object was in use (NtClose() drops the
++     * handle's reference last), and close_inproc_sync_begin() had the server
++     * keep the object under this serial: let it go now. */
++    if (serial) release_detached_inproc_sync( serial );
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -682,6 +702,7 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
++            sync->serial = 0;
+         }
+     }
+     SERVER_END_REQ;
+@@ -761,23 +782,47 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
+ }
+ 
+ /* caller must hold fd_cache_mutex */
+-void close_inproc_sync( HANDLE handle )
++/* First half of closing a handle, before the server request: drop the cache
++ * entry and find out whether another thread is still using the object.
++ * Returns the entry, with a reference held, for close_inproc_sync_end(). */
++struct inproc_sync *close_inproc_sync_begin( HANDLE handle, unsigned int *serial )
+ {
+     struct inproc_sync *cache;
+ 
++    *serial = 0;
+     if (do_fsync())
+     {
+         fsync_close( handle );
+-        return;
+-    }
+-    if (inproc_device_fd < 0) return;
+-    if ((cache = get_cached_inproc_sync( handle )))
+-    {
+-        cache->closed = 1;
+-        /* once for the reference we just grabbed, and once for the handle */
+-        release_inproc_sync( cache );
+-        release_inproc_sync( cache );
++        return NULL;
+     }
++    if (inproc_device_fd < 0) return NULL;
++    if (!(cache = get_cached_inproc_sync( handle ))) return NULL;
++    cache->closed = 1;
++    /* One reference is the handle's and one is ours; any more belong to
++     * threads in the middle of an operation, typically a wait. Such a thread
++     * can still acquire a mutex through the fd, and the server must then know
++     * the mutex to abandon it if the thread dies, so have the server keep the
++     * object under this entry's serial until the last user releases it. */
++    if (cache->type == INPROC_SYNC_MUTEX && InterlockedCompareExchange( &cache->refcount, 0, 0 ) > 2)
++        *serial = cache->serial;
++    return cache;
++}
++
++/* Second half, after the server request; serial is what the request carried, or 0 */
++void close_inproc_sync_end( struct inproc_sync *cache, unsigned int serial )
++{
++    cache->serial = serial;
++    /* once for the reference we grabbed, and once for the handle */
++    release_inproc_sync( cache );
++    release_inproc_sync( cache );
++}
++
++void close_inproc_sync( HANDLE handle )
++{
++    struct inproc_sync *cache;
++    unsigned int serial;
++
++    if ((cache = close_inproc_sync_begin( handle, &serial ))) close_inproc_sync_end( cache, 0 );
+ }
+ 
+ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 41163e0..a9608cb 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -418,6 +418,9 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
+ 
+ extern void dbg_init(void);
+ 
++struct inproc_sync;
++extern struct inproc_sync *close_inproc_sync_begin( HANDLE handle, unsigned int *serial );
++extern void close_inproc_sync_end( struct inproc_sync *cache, unsigned int serial );
+ extern void close_inproc_sync( HANDLE handle );
+ 
+ extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
+diff --git a/server/handle.c b/server/handle.c
+index a88f94a..b417276 100644
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -670,7 +670,15 @@ unsigned int get_handle_table_count( struct process *process )
+ /* close a handle */
+ DECL_HANDLER(close_handle)
+ {
+-    unsigned int err = close_handle( current->process, req->handle );
++    struct object *obj;
++    unsigned int err;
++
++    if (req->inproc_serial && (obj = get_handle_obj( current->process, req->handle, 0, NULL )))
++    {
++        detach_inproc_sync( current->process, obj, req->inproc_serial );
++        release_object( obj );
++    }
++    err = close_handle( current->process, req->handle );
+     set_error( err );
+ }
+ 
+@@ -701,7 +709,17 @@ DECL_HANDLER(dup_handle)
+         }
+         /* close the handle no matter what happened */
+         if ((req->options & DUPLICATE_CLOSE_SOURCE) && (src != dst || req->src_handle != reply->handle))
++        {
++            struct object *obj;
++
++            if (req->inproc_serial && src == current->process
++                && (obj = get_handle_obj( src, req->src_handle, 0, NULL )))
++            {
++                detach_inproc_sync( src, obj, req->inproc_serial );
++                release_object( obj );
++            }
+             close_handle( src, req->src_handle );
++        }
+         release_object( src );
+     }
+ }
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index a7020ef..c70de28 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -23,6 +23,7 @@
+ #include <assert.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -75,6 +76,51 @@ struct inproc_sync
+ 
+ static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
+ 
++/* Mutexes whose server object was destroyed while a thread still owned them. A client can still hold
++ * a duplicate of the fd (a thread waiting on a handle that has since been closed), and the ntsync
++ * driver abandons a mutex only through NTSYNC_IOC_MUTEX_KILL on that mutex, so the fd is kept until
++ * the owner has released or abandoned it. */
++struct orphan_mutex
++{
++    struct list entry;
++    int         fd;
++};
++
++static struct list orphan_mutexes = LIST_INIT( orphan_mutexes );
++
++static int inproc_mutex_owned( int fd )
++{
++    struct ntsync_mutex_args args = {0};
++    return !ioctl( fd, NTSYNC_IOC_MUTEX_READ, &args ) && args.owner;
++}
++
++static void prune_orphan_mutexes(void)
++{
++    struct orphan_mutex *orphan, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( orphan, next, &orphan_mutexes, struct orphan_mutex, entry )
++    {
++        if (inproc_mutex_owned( orphan->fd )) continue;
++        list_remove( &orphan->entry );
++        close( orphan->fd );
++        free( orphan );
++    }
++}
++
++/* In-process syncs whose handle a process closed while one of its threads was still using the cached fd
++ * (typically a wait in progress). That thread can still acquire the mutex through the fd, so the server keeps
++ * the object, and with it the mutex's place on inproc_mutexes, until the client reports that the last user is
++ * done, or the process dies. */
++struct detached_sync
++{
++    struct list         entry;
++    struct process     *process;  /* process that closed the handle; the record dies with it */
++    unsigned int        serial;   /* id chosen by the client, unique within the process */
++    struct inproc_sync *sync;     /* the reference this record holds */
++};
++
++static struct list detached_syncs = LIST_INIT( detached_syncs );
++
+ static void inproc_sync_dump( struct object *obj, int verbose );
+ static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
+ static void inproc_sync_destroy( struct object *obj );
+@@ -262,12 +308,25 @@ static void inproc_sync_destroy( struct object *obj )
+     assert( obj->ops == &inproc_sync_ops );
+     list_remove( &sync->entry );
+     if (do_fsync()) fsync_free_shm_idx( sync->fd );
+-    else            close( sync->fd );
++    else if (sync->type == INPROC_SYNC_MUTEX && inproc_mutex_owned( sync->fd ))
++    {
++        struct orphan_mutex *orphan;
++
++        prune_orphan_mutexes();
++        if ((orphan = malloc( sizeof(*orphan) )))
++        {
++            orphan->fd = sync->fd;
++            list_add_tail( &orphan_mutexes, &orphan->entry );
++        }
++        else close( sync->fd );
++    }
++    else close( sync->fd );
+ }
+ 
+ void abandon_inproc_mutexes( thread_id_t tid )
+ {
+     struct inproc_sync *mutex;
++    struct orphan_mutex *orphan;
+ 
+     if (do_fsync())
+     {
+@@ -278,6 +337,55 @@ void abandon_inproc_mutexes( thread_id_t tid )
+ 
+     LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
+         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++    LIST_FOR_EACH_ENTRY( orphan, &orphan_mutexes, struct orphan_mutex, entry )
++        ioctl( orphan->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++    prune_orphan_mutexes();
++}
++
++void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial )
++{
++    struct object *sync;
++    struct detached_sync *detached;
++
++    if (!(sync = get_obj_sync( obj ))) return;
++    if (sync->ops == &inproc_sync_ops && ((struct inproc_sync *)sync)->type == INPROC_SYNC_MUTEX
++        && (detached = malloc( sizeof(*detached) )))
++    {
++        detached->process = process;
++        detached->serial  = serial;
++        detached->sync    = (struct inproc_sync *)sync;  /* keeps the reference from get_obj_sync() */
++        list_add_tail( &detached_syncs, &detached->entry );
++        return;
++    }
++    release_object( sync );
++}
++
++unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial )
++{
++    struct detached_sync *detached;
++
++    LIST_FOR_EACH_ENTRY( detached, &detached_syncs, struct detached_sync, entry )
++    {
++        if (detached->process != process || detached->serial != serial) continue;
++        list_remove( &detached->entry );
++        release_object( detached->sync );
++        free( detached );
++        return STATUS_SUCCESS;
++    }
++    return STATUS_INVALID_PARAMETER;
++}
++
++void release_process_inproc_syncs( struct process *process )
++{
++    struct detached_sync *detached, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( detached, next, &detached_syncs, struct detached_sync, entry )
++    {
++        if (detached->process != process) continue;
++        list_remove( &detached->entry );
++        release_object( detached->sync );
++        free( detached );
++    }
+ }
+ 
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+@@ -341,6 +449,19 @@ void abandon_inproc_mutexes( thread_id_t tid )
+ {
+ }
+ 
++void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial )
++{
++}
++
++unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++void release_process_inproc_syncs( struct process *process )
++{
++}
++
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+ {
+     return -1;
+@@ -363,3 +484,8 @@ DECL_HANDLER(get_inproc_sync_fd)
+ 
+     release_object( obj );
+ }
++
++DECL_HANDLER(release_inproc_sync)
++{
++    set_error( release_detached_inproc_sync( current->process, req->serial ) );
++}
+diff --git a/server/object.h b/server/object.h
+index 21f5ea8..ff369a0 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -255,6 +255,9 @@ extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
+ extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
+ extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count );
+ extern void abandon_inproc_mutexes( thread_id_t owner );
++extern void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial );
++extern unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial );
++extern void release_process_inproc_syncs( struct process *process );
+ extern void signal_inproc_sync( struct inproc_sync *sync );
+ extern void reset_inproc_sync( struct inproc_sync *sync );
+ 
+diff --git a/server/process.c b/server/process.c
+index 287718a..130d2ca 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -808,6 +808,7 @@ static void process_destroy( struct object *obj )
+     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
+ 
+     close_process_handles( process );
++    release_process_inproc_syncs( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
+ 
+     if (process->job)
+@@ -1013,6 +1014,7 @@ static void process_killed( struct process *process )
+     process->desktop = 0;
+     cancel_terminating_process_asyncs( process );
+     close_process_handles( process );
++    release_process_inproc_syncs( process );
+     if (process->idle_event) release_object( process->idle_event );
+     process->idle_event = NULL;
+     assert( !process->console );
+diff --git a/server/protocol.def b/server/protocol.def
+index f1b7dee..c53894f 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1383,6 +1383,7 @@ struct cpu_topology_override
+ /* Close a handle for the current process */
+ @REQ(close_handle)
+     obj_handle_t handle;       /* handle to close */
++    unsigned int inproc_serial; /* if nonzero, keep the in-process sync (still used by another thread) under this serial */
+ @END
+ 
+ 
+@@ -1404,6 +1405,7 @@ struct cpu_topology_override
+     unsigned int access;       /* wanted access rights */
+     unsigned int attributes;   /* object attributes */
+     unsigned int options;      /* duplicate options */
++    unsigned int inproc_serial; /* as for close_handle, when closing the source */
+ @REPLY
+     obj_handle_t handle;       /* duplicated handle in dst process */
+ @END
+@@ -4358,3 +4360,10 @@ enum fsync_type
+     unsigned int shm_idx;
+ @REPLY
+ @END
++
++
++/* Stop keeping an in-process sync that close_handle / dup_handle kept: its last user is done.
++ * Appended after every other request so that existing request numbers stay the same. */
++@REQ(release_inproc_sync)
++    unsigned int serial;        /* serial given to close_handle / dup_handle */
++@END
