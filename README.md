@@ -1,7 +1,7 @@
 # prototype_SM2_proton_fix
 A prototype fix created by jegglest (https://github.com/jegglest) using an LLM that fixes constant crashing in Warhammer 40,000: Space Marine 2 that started around patch 14 and continues to be present in patch 15. 
 
-#### Jegglest made his own repository with the fix, which provides a streamlined environment to compile the fix yourself, along with better-structured explanations: https://github.com/jegglest/proton-je. Once an already compiled build is available there, it will supersede this one and make it obsolete.
+#### <i>Jegglest made his own repository with the fix, which provides a streamlined environment to compile the fix yourself, along with better-structured explanations: https://github.com/jegglest/proton-je. Once an already compiled build is available there, it will supersede this one and make it obsolete.</i>
 
 
 Compiled by me to play comfortably until official fixes are available.
