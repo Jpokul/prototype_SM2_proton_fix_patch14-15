@@ -1,5 +1,6 @@
 Jegglest made his version available, and it's probably better to use that one, as he is the creator of the fix:
 https://github.com/jegglest/proton-je#installing-a-build
+
 It will likely also be available through ProtonPlus in the future. He also claims that FSR 4 works with his proton-je.
 
 # prototype_SM2_proton_fix
