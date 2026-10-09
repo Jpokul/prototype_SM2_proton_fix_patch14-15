@@ -1,3 +1,7 @@
+Jegglest made his version available, and it's probably better to use that one, as he is the creator of the fix:
+https://github.com/jegglest/proton-je#installing-a-build
+It will likely also be available through ProtonPlus in the future. He also claims that FSR 4 works with his proton-je.
+
 # prototype_SM2_proton_fix
 A prototype fix created by jegglest (https://github.com/jegglest) using an LLM that fixes constant crashing in Warhammer 40,000: Space Marine 2 that started around patch 14 and continues to be present in patch 15. 
 
